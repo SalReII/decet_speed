@@ -9,16 +9,27 @@ runs through model.fused_forward:
 - rope.py     LoRA add + rotary + scatter of q/k/v to SDPA's layout (Triton)
 - nf4.py      NF4 double-quant unpacking for every frozen projection (Triton)
 - model.py    the Qwen2 training forward on real (non-pad) tokens built from the above
-- warmup.py   compiles the kernels on a background thread while the model loads
+- warmup.py   compiles the kernels on a background thread during startup
+- startup.py  removes startup work `soup train` repeats for nothing (package scan, dataset hashing)
 """
 
 
 def apply():
+    from . import startup, warmup
+
+    # Compile our kernels on a background thread while the imports and data preparation run.
+    try:
+        warmup.start(startup.base_model_from_argv())
+    except Exception:  # noqa: BLE001
+        pass
+
     from . import trainer_patch
 
-    for patch in (trainer_patch.patch_forward, trainer_patch.patch_sft_compute_loss,
-                  trainer_patch.patch_rewind, trainer_patch.patch_setup):
-        try:
-            patch()
-        except Exception as exc:  # noqa: BLE001 - a missing package must not stop `soup train`
-            print(f"[solution] {patch.__name__} not installed: {exc!r}", flush=True)
+    with startup.reuse_package_scan():  # trl's import repeats transformers' package scan
+        for patch in (trainer_patch.patch_forward, trainer_patch.patch_sft_compute_loss,
+                      trainer_patch.patch_rewind, trainer_patch.patch_setup,
+                      startup.random_dataset_fingerprints):
+            try:
+                patch()
+            except Exception as exc:  # noqa: BLE001 - a missing package must not stop training
+                print(f"[solution] {patch.__name__} not installed: {exc!r}", flush=True)
