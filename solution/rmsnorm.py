@@ -78,7 +78,9 @@ def _launch_fwd(x, delta, weight, eps, pad_idx, padded_rows):
     s = torch.empty_like(x) if delta is not None else x
     y = torch.empty((rows, hidden), dtype=torch.float16, device=x.device)
     rstd = torch.empty((rows,), dtype=torch.float32, device=x.device)
-    if pad_idx is not None:
+    if pad_idx is not None and padded_rows == rows:  # every row is written: no fill needed
+        ypad = torch.empty((padded_rows, hidden), dtype=torch.float32, device=x.device)
+    elif pad_idx is not None:
         ypad = torch.zeros((padded_rows, hidden), dtype=torch.float32, device=x.device)
     else:
         ypad = torch.empty((0, hidden), dtype=torch.float32, device=x.device)

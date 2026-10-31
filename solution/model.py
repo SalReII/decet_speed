@@ -26,6 +26,7 @@ builds) take this path.
 import torch
 
 from .head import IGNORE_INDEX, fused_head_loss
+from .lora_dropout import draw_mask, lora_dropout_input
 from .mlp import fused_mlp
 from .nf4 import frozen_linear, unpack_concat
 
@@ -211,18 +212,21 @@ def can_run(causal_lm, input_ids, attention_mask, labels, extra):
     return True
 
 
-def _lora_branch(module, y_pad, batch, seq, pos_idx):
-    """peft's `lora_B(lora_A(dropout(x))) * scaling` for the real tokens, where x is the
-    padded fp32 norm output base Soup feeds it (same shape and dtype, so the same dropout
-    draws); A and B then run on the real tokens only."""
+def _lora_branch(module, y32, batch, seq, pos_idx):
+    """peft's `lora_B(lora_A(dropout(x))) * scaling` for the real tokens. x is the fp32 norm
+    output; the dropout mask is drawn by PyTorch for base Soup's padded [batch, seq, hidden]
+    fp32 input (same generator calls, so the same mask) and applied by our kernel."""
     parts = _lora_parts(module)
     if parts is None:
         return None
     dropout, lora_a, lora_b, scaling = parts
-    hidden = y_pad.shape[-1]
-    dropped = dropout(y_pad.view(batch, seq, hidden)).view(batch * seq, hidden)
-    rows = dropped.index_select(0, pos_idx)
-    return lora_b(lora_a(rows)) * scaling
+    p = float(dropout.p) if isinstance(dropout, torch.nn.Dropout) and dropout.training else 0.0
+    if p > 0.0:
+        keep = draw_mask((batch, seq, y32.shape[1]), p, y32.device)
+        x16 = lora_dropout_input(y32, keep, pos_idx, p)
+    else:
+        x16 = y32.to(torch.float16)
+    return lora_b(lora_a(x16)) * scaling
 
 
 def fused_forward(causal_lm, input_ids, attention_mask, labels, num_items_in_batch):
@@ -232,7 +236,6 @@ def fused_forward(causal_lm, input_ids, attention_mask, labels, num_items_in_bat
     inner = causal_lm.model
     batch, seq = input_ids.shape
     dev = input_ids.device
-    padded = batch * seq
     mask = attention_mask.bool()
     # Right padding (TRL's collator): every row is a prefix of real tokens. One sync for both.
     not_prefix = (mask[:, 1:] & ~mask[:, :-1]).any().view(1)
@@ -241,6 +244,8 @@ def fused_forward(causal_lm, input_ids, attention_mask, labels, num_items_in_bat
         return None
     lengths = info[1:]
     pos_idx = mask.reshape(-1).nonzero().squeeze(1)
+    rows = pos_idx.numel()
+    row_idx = torch.arange(rows, device=dev)
     if DENSE_WEIGHTS and plan.layers and plan.layers[0].dense_qkv is None:
         for lp in plan.layers:
             lp.unpack_dense()
@@ -258,12 +263,13 @@ def fused_forward(causal_lm, input_ids, attention_mask, labels, num_items_in_bat
     delta = None
     for lp in plan.layers:
         layer = lp.layer
-        s, y, y_pad = add_rmsnorm(s, delta, layer.input_layernorm.weight,
-                                  layer.input_layernorm.variance_epsilon, pos_idx, padded)
+        # y: fp16 for the GEMMs; y32: the same rows in fp32 for the LoRA dropout input
+        s, y, y32 = add_rmsnorm(s, delta, layer.input_layernorm.weight,
+                                layer.input_layernorm.variance_epsilon, row_idx, rows)
         qkv = frozen_linear(y, (lp.q, lp.k, lp.v), lp.qkv_bias, lp.dense_qkv)
-        lora_q = _lora_branch(lp.attn.q_proj, y_pad, batch, seq, pos_idx)
-        lora_v = _lora_branch(lp.attn.v_proj, y_pad, batch, seq, pos_idx)
-        del y_pad
+        lora_q = _lora_branch(lp.attn.q_proj, y32, batch, seq, pos_idx)
+        lora_v = _lora_branch(lp.attn.v_proj, y32, batch, seq, pos_idx)
+        del y32
         q, k, v = rope_pack(qkv, lora_q, lora_v, cos, sin, pos_idx, seq,
                             plan.n_heads, plan.n_kv, plan.head_dim)
         del qkv, lora_q, lora_v

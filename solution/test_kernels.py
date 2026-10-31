@@ -213,3 +213,26 @@ def test_fused_head_loss():
     (loss * scale).backward()
     (ref_loss * scale).backward()
     close(h.grad, hr.grad, 2e-2)
+
+
+def test_lora_dropout_input_matches_peft_dropout():
+    from solution.lora_dropout import draw_mask, lora_dropout_input
+
+    batch, seq, hidden, p = (2, 6, 96, 0.3) if SMALL else (4, 77, 1536, 0.05)
+    lengths = [seq, seq - 3]
+    lengths = lengths + [seq - 9] * (batch - 2)
+    pos_idx = torch.cat([b * seq + torch.arange(n) for b, n in enumerate(lengths)]).to(DEV)
+    y32 = torch.randn(pos_idx.numel(), hidden, device=DEV, requires_grad=True)
+
+    torch.manual_seed(7)  # peft: dropout on the padded fp32 [batch, seq, hidden] input
+    padded = torch.zeros(batch * seq, hidden, device=DEV).index_copy(0, pos_idx, y32.detach())
+    padded.requires_grad_(True)
+    ref = torch.nn.functional.dropout(padded.view(batch, seq, hidden), p, True)
+    ref = ref.view(batch * seq, hidden)[pos_idx].to(torch.float16)
+    torch.manual_seed(7)
+    out = lora_dropout_input(y32, draw_mask((batch, seq, hidden), p, torch.device(DEV)), pos_idx, p)
+    assert torch.equal(out, ref)
+    grad = torch.randn_like(out)
+    out.backward(grad)
+    ref.backward(grad)
+    close(y32.grad, padded.grad[pos_idx], 1e-6)

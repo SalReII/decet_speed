@@ -14,6 +14,8 @@ from types import SimpleNamespace
 
 import torch
 
+from ._common import next_pow2
+
 _thread = None
 
 
@@ -48,6 +50,15 @@ def compile_kernels(hidden, intermediate, n_heads, n_kv, head_dim, vocab, device
         rmsnorm._launch_fwd(x, None, w, 1e-6, pad_idx, 3)       # same compiled variants as
         rmsnorm._launch_fwd(x, delta, w, 1e-6, None, 0)         # above (dummies share dtypes);
         rmsnorm._launch_bwd(s, rstd, w, None, None, y, None, True)  # kept as a cheap check
+
+        from . import lora_dropout
+
+        keep = torch.ones((2, hidden), dtype=torch.uint8, device=dev)
+        x16 = torch.empty((2, hidden), dtype=torch.float16, device=dev)
+        lora_dropout.lora_dropout_fwd_kernel[(2,)](x, keep, pad_idx, x16, 1.0, H=hidden,
+                                                   BLOCK=next_pow2(hidden), num_warps=8)
+        lora_dropout.lora_dropout_bwd_kernel[(2,)](x16, keep, pad_idx, x.clone(), 1.0, H=hidden,
+                                                   BLOCK=next_pow2(hidden), num_warps=8)
 
         gu = torch.zeros((1, 2 * intermediate), dtype=torch.float16, device=dev)
         act = mlp.gated_silu(gu)
